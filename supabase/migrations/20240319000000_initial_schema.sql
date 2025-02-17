@@ -1,123 +1,128 @@
 
--- Enable UUID extension
+-- Enable necessary extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";
 
--- Stakeholders table
+-- Core tables
 CREATE TABLE stakeholders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
-    full_name TEXT NOT NULL,
-    title TEXT,
-    organization TEXT,
+    name TEXT NOT NULL,
+    organization TEXT NOT NULL,
+    role TEXT,
     email TEXT,
-    phone TEXT,
     linkedin_url TEXT,
     twitter_handle TEXT,
-    category TEXT,
-    tags TEXT[],
-    influence_score DECIMAL(3,2),
-    engagement_level TEXT,
-    notes TEXT,
-    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-    last_contact_date TIMESTAMP WITH TIME ZONE
+    communication_style JSONB,
+    interests TEXT[],
+    metadata JSONB,
+    search_vector TSVECTOR GENERATED ALWAYS AS (
+        to_tsvector('english', 
+            COALESCE(name, '') || ' ' || 
+            COALESCE(organization, '') || ' ' || 
+            COALESCE(role, '')
+        )
+    ) STORED
 );
 
--- Communications table
-CREATE TABLE communications (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
+CREATE TABLE interactions (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     stakeholder_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
-    type TEXT NOT NULL, -- email, meeting, call, social_media, etc.
-    direction TEXT NOT NULL, -- incoming, outgoing
-    content TEXT,
-    sentiment DECIMAL(3,2),
-    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-    date TIMESTAMP WITH TIME ZONE NOT NULL
-);
-
--- Organizations table
-CREATE TABLE organizations (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
-    name TEXT NOT NULL,
-    industry TEXT,
-    website TEXT,
-    linkedin_url TEXT,
-    description TEXT,
-    size_category TEXT,
-    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE
-);
-
--- Relationships table (for stakeholder-to-stakeholder connections)
-CREATE TABLE relationships (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
-    stakeholder1_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
-    stakeholder2_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
-    relationship_type TEXT,
-    strength DECIMAL(3,2),
+    interaction_type TEXT NOT NULL,
+    interaction_date TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
     notes TEXT,
-    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
-    UNIQUE(stakeholder1_id, stakeholder2_id)
+    sentiment_score FLOAT,
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
 );
 
--- News mentions table
-CREATE TABLE news_mentions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
+CREATE TABLE communication_patterns (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
     stakeholder_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
-    organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    url TEXT NOT NULL,
-    publication_date TIMESTAMP WITH TIME ZONE NOT NULL,
-    source TEXT,
-    summary TEXT,
-    sentiment DECIMAL(3,2),
-    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE
+    pattern_type TEXT NOT NULL,
+    confidence FLOAT NOT NULL,
+    analysis_data JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
 );
 
--- RLS Policies
+CREATE TABLE social_media_data (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    stakeholder_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    platform_id TEXT,
+    content_type TEXT NOT NULL,
+    content JSONB,
+    engagement_metrics JSONB,
+    collected_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+);
+
+-- Create stakeholder_access table for RLS
+CREATE TABLE stakeholder_access (
+    stakeholder_id UUID REFERENCES stakeholders(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    access_level TEXT NOT NULL,
+    granted_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
+    PRIMARY KEY (stakeholder_id, user_id)
+);
+
+-- Indexes for performance
+CREATE INDEX stakeholders_search_idx ON stakeholders USING gin(search_vector);
+CREATE INDEX interactions_stakeholder_idx ON interactions(stakeholder_id);
+CREATE INDEX social_media_stakeholder_idx ON social_media_data(stakeholder_id);
+CREATE INDEX stakeholder_access_user_idx ON stakeholder_access(user_id);
+
+-- Row Level Security Policies
 ALTER TABLE stakeholders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE communications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE relationships ENABLE ROW LEVEL SECURITY;
-ALTER TABLE news_mentions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE interactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE communication_patterns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE social_media_data ENABLE ROW LEVEL SECURITY;
+ALTER TABLE stakeholder_access ENABLE ROW LEVEL SECURITY;
 
--- Create policies
-CREATE POLICY "Users can see their own stakeholders"
+-- Stakeholder access policies
+CREATE POLICY "Users can view stakeholders they have access to"
     ON stakeholders FOR SELECT
-    USING (auth.uid() = user_id);
+    USING (
+        auth.uid() IN (
+            SELECT user_id FROM stakeholder_access WHERE stakeholder_id = id
+        )
+    );
 
-CREATE POLICY "Users can insert their own stakeholders"
+CREATE POLICY "Users can insert stakeholders"
     ON stakeholders FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
+    WITH CHECK (auth.uid() IS NOT NULL);
 
-CREATE POLICY "Users can update their own stakeholders"
-    ON stakeholders FOR UPDATE
-    USING (auth.uid() = user_id);
+-- Interaction access policies
+CREATE POLICY "Users can view interactions for accessible stakeholders"
+    ON interactions FOR SELECT
+    USING (
+        stakeholder_id IN (
+            SELECT stakeholder_id FROM stakeholder_access 
+            WHERE user_id = auth.uid()
+        )
+    );
 
-CREATE POLICY "Users can delete their own stakeholders"
-    ON stakeholders FOR DELETE
-    USING (auth.uid() = user_id);
+-- Communication patterns access policies
+CREATE POLICY "Users can view patterns for accessible stakeholders"
+    ON communication_patterns FOR SELECT
+    USING (
+        stakeholder_id IN (
+            SELECT stakeholder_id FROM stakeholder_access 
+            WHERE user_id = auth.uid()
+        )
+    );
 
--- Similar policies for other tables
-CREATE POLICY "Users can see their own communications"
-    ON communications FOR SELECT
-    USING (auth.uid() = user_id);
-
-CREATE POLICY "Users can insert their own communications"
-    ON communications FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
-
--- Add similar policies for organizations, relationships, and news_mentions tables
-
--- Create indexes for better query performance
-CREATE INDEX idx_stakeholders_user_id ON stakeholders(user_id);
-CREATE INDEX idx_communications_stakeholder_id ON communications(stakeholder_id);
-CREATE INDEX idx_relationships_stakeholders ON relationships(stakeholder1_id, stakeholder2_id);
-CREATE INDEX idx_news_mentions_stakeholder_id ON news_mentions(stakeholder_id);
-CREATE INDEX idx_news_mentions_organization_id ON news_mentions(organization_id);
+-- Social media data access policies
+CREATE POLICY "Users can view social media data for accessible stakeholders"
+    ON social_media_data FOR SELECT
+    USING (
+        stakeholder_id IN (
+            SELECT stakeholder_id FROM stakeholder_access 
+            WHERE user_id = auth.uid()
+        )
+    );
 
 -- Add updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -134,4 +139,7 @@ CREATE TRIGGER update_stakeholders_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
--- Add similar triggers for other tables that have updated_at
+CREATE TRIGGER update_communication_patterns_updated_at
+    BEFORE UPDATE ON communication_patterns
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
